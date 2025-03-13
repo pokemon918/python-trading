@@ -1,0 +1,1 @@
+ALTER TABLE "scores" ADD "forward_week_trade_count" DOUBLE PRECISION NOT NULL DEFAULT '0';

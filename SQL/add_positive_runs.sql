@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD "gens_to_positive" INTEGER NOT NULL DEFAULT '0';

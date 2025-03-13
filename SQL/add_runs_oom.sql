@@ -1,0 +1,3 @@
+ALTER TABLE "runs" ADD "machine_name" VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE "runs" ADD "process_id" INTEGER NOT NULL DEFAULT '0';
+ALTER TABLE "runs" ADD "oom_error" BOOLEAN DEFAULT FALSE;

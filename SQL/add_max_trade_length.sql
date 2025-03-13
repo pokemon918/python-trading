@@ -1,0 +1,1 @@
+ALTER TABLE "scores" ADD "max_trade_length" DOUBLE PRECISION NOT NULL DEFAULT '0';

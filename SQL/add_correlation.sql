@@ -1,0 +1,1 @@
+ALTER TABLE "scores" ADD "average_correlation_signal0" DOUBLE PRECISION NOT NULL DEFAULT '0';

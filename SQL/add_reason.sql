@@ -1,0 +1,2 @@
+ALTER TABLE "trades" ADD "reason" VARCHAR(32) NOT NULL DEFAULT '';
+	
