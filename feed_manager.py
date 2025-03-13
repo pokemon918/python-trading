@@ -12,7 +12,6 @@ import pytz
 import sys
 import ib_async
 import asyncio
-import psycopg2
 
 from constants import BarMinutes, BarTypes, OHLC, Severity
 from database_health import write_activity
@@ -123,47 +122,24 @@ def prepare_data(unique_markets):
     return all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status
 
 def on_pending_tickers(tickers):
-    """Handle incoming ticks with improved bar creation logic"""
-    for ticker in tickers:
-        if ticker.contract.localSymbol in market_lookup:
-            market = market_lookup[ticker.contract.localSymbol]
-            
-            # Get current timestamp with proper timezone handling
-            current_time = datetime.now(eastern_tz)
-            
-            # Process the tick
-            process_tick(market, ticker, current_time)
 
-def process_tick(market, ticker, current_time):
-    """Process a single tick with improved bar handling"""
-    # Extract tick data
-    last_price = ticker.last
-    volume = ticker.volume
-    
-    # Store last price and volume
-    all_last_prices[market] = last_price
-    all_volumes[market] = volume
-    
-    # Check if we need to create a new bar based on broker timestamp
-    broker_time = ticker.time if hasattr(ticker, 'time') else current_time
-    
-    # Remove timezone for consistent comparison if needed
-    if broker_time.tzinfo:
-        broker_time = broker_time.replace(tzinfo=None)
-    
-    # Get current bar minute
-    current_bar_minute = get_bar_minute(broker_time)
-    last_bar_minute = get_last_bar_minute(market)
-    
-    # If we've moved to a new minute, close the current bar and create a new one
-    if current_bar_minute != last_bar_minute and last_bar_minute is not None:
-        # Use a lock to prevent double closure
-        if not is_bar_being_closed(market, last_bar_minute):
-            try:
-                set_bar_closing_status(market, last_bar_minute, True)
-                close_and_create_bar(market, last_bar_minute, broker_time, last_price, volume)
-            finally:
-                set_bar_closing_status(market, last_bar_minute, False)
+    current_timestamp = datetime.now()
+    end_current_minute_timestamp = current_timestamp.replace(second=0, microsecond=0)
+    end_current_minute_timestamp = end_current_minute_timestamp + timedelta(minutes=1)
+
+    for ticker in tickers:
+        if not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+            symbol = ticker.contract.localSymbol
+            market = market_lookup[symbol]
+            if market in all_ticks:
+                mid = (ticker.bid + ticker.ask) / 2
+
+                if end_current_minute_timestamp not in all_ticks[market]:
+                    all_ticks[market][end_current_minute_timestamp] = []
+
+                all_ticks[market][end_current_minute_timestamp].append(mid)
+                all_volumes[market][end_current_minute_timestamp] = ticker.rtTradeVolume
+                # print(f'{datetime.now()},Tick,{market},{mid},{ticker.rtTradeVolume},{end_current_minute_timestamp}')
 
 def schedule_next_minute():
     current_time = time.time()  # Current time in seconds since the epoch
@@ -371,8 +347,6 @@ def get_database_bars(markets, start_week):
                 last_5_values = all_database_bars[market][BarTypes.Minute1.value][key][-5:]
                 print(f"{market} = {key}: {last_5_values}")
 
-    return True
-
 def get_broker_bars_from_exchange(contracts, market):
 
     contract = contracts[market]
@@ -460,39 +434,6 @@ async def main():
     # Run script
     asyncio.wait(3000)    
 
-def initialize_feed_manager():
-    # 1. Connect to IB
-    ib = connect_to_interactive_brokers()
-    
-    # 2. Load instrument data first
-    instruments_df = get_current_instruments(datetime.now(), markets, settings.host, 
-                                           settings.strategies_database, settings.user, settings.password)
-    
-    # 3. Initialize data structures
-    all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status = prepare_data(markets)
-    
-    # 4. Create Redis cache
-    redis_cache = create_redis_cache()
-    
-    # 5. Setup contracts
-    contracts, market_lookup, symbol_lookup = get_ib_contracts(markets, instruments_df)
-    
-    # 6. Load database bars with validation
-    database_bars_loaded = get_database_bars(markets, start_week)
-    
-    # 7. Only proceed with joining if database bars are loaded
-    if database_bars_loaded:
-        # Now safe to join bars and run data integrity
-        process_and_join_bars(markets, all_database_bars, all_broker_bars)
-    
-    # 8. Setup market data subscription only after initialization is complete
-    subscribe_to_live_data(ib, markets, contracts)
-    
-    # 9. Setup connection monitoring
-    start_connection_monitor(ib, markets)
-    
-    return ib, contracts, market_lookup, symbol_lookup, redis_cache, all_bars
-
 if __name__ == "__main__":
 
     print(f'{datetime.now()}: Starting Feed Manager')
@@ -551,164 +492,3 @@ if __name__ == "__main__":
     ib.disconnect()
 
     print(f'{datetime.now()}: Disconnected')
-
-# New connection monitoring system
-def start_connection_monitor(ib, markets):
-    """Start a background task to monitor IB connection status"""
-    asyncio.create_task(connection_monitor_task(ib, markets))
-
-async def connection_monitor_task(ib, markets):
-    """Monitor connection status and handle reconnection"""
-    while True:
-        if not ib.isConnected():
-            print(f'{datetime.now()}: Connection lost, attempting to reconnect')
-            # Update market status
-            update_market_status(markets, 'disconnected')
-            # Attempt reconnection
-            try:
-                ib.connect('127.0.0.1', 4002, clientId=1)
-                if ib.isConnected():
-                    print(f'{datetime.now()}: Reconnection successful')
-                    # Update market status
-                    update_market_status(markets, 'connected')
-            except Exception as e:
-                print(f'{datetime.now()}: Reconnection failed: {str(e)}')
-        
-        # Check every 5 seconds
-        await asyncio.sleep(5)
-
-def update_market_status(markets, status):
-    """Update market status in Redis for live trading system"""
-    try:
-        r = redis.Redis(host='localhost', port=6379, db=0)
-        for market in markets:
-            r.publish('market_status', json.dumps({
-                'market': market,
-                'status': status,
-                'timestamp': datetime.now().isoformat()
-            }))
-    except Exception as e:
-        print(f'{datetime.now()}: Failed to update market status: {str(e)}')
-
-# Symbol resolution service
-def resolve_symbol(market, date=None):
-    """Resolve the correct symbol for a market on a given date"""
-    if date is None:
-        date = datetime.now()
-    
-    # Query the database for the correct instrument
-    query = """
-    SELECT symbol, expiry 
-    FROM instruments 
-    WHERE market = %s 
-    AND start_date <= %s 
-    AND end_date > %s
-    """
-    
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            host=settings.host,
-            database=settings.strategies_database,
-            user=settings.user,
-            password=settings.password
-        )
-        cursor = conn.cursor()
-        cursor.execute(query, (market, date, date))
-        result = cursor.fetchone()
-        
-        if result:
-            return result[0]  # Return the symbol
-        else:
-            print(f'{datetime.now()}: No symbol found for {market} on {date}')
-            return None
-    except Exception as e:
-        print(f'{datetime.now()}: Error resolving symbol: {str(e)}')
-        return None
-    finally:
-        if conn:
-            conn.close()
-
-# Contract roll handler
-class ContractRollManager:
-    def __init__(self, ib, markets, instruments_df):
-        self.ib = ib
-        self.markets = markets
-        self.instruments_df = instruments_df
-        self.current_contracts = {}
-        self.initialize_contracts()
-    
-    def initialize_contracts(self):
-        """Initialize contracts for all markets"""
-        for market in self.markets:
-            self.update_contract(market)
-    
-    def update_contract(self, market):
-        """Update contract for a specific market"""
-        today = datetime.now().date()
-        
-        # Find the current active instrument
-        market_instruments = self.instruments_df[self.instruments_df['market'] == market]
-        current_instrument = market_instruments[
-            (market_instruments['start_date'].dt.date <= today) & 
-            (market_instruments['end_date'].dt.date > today)
-        ]
-        
-        if len(current_instrument) == 0:
-            print(f'{datetime.now()}: No active instrument found for {market}')
-            return False
-        
-        # Extract contract details
-        row = current_instrument.iloc[0]
-        expiry_date = row['expiry'].strftime('%Y%m')
-        exchange = row['exchange']
-        symbol = row['symbol']
-        
-        # Create and qualify the contract
-        contract = ib_async.Future(
-            symbol=market, 
-            exchange=exchange, 
-            lastTradeDateOrContractMonth=expiry_date, 
-            currency='USD'
-        )
-        
-        try:
-            self.ib.qualifyContracts(contract)
-            self.current_contracts[market] = {
-                'contract': contract,
-                'symbol': symbol,
-                'expiry': row['expiry'],
-                'last_checked': datetime.now()
-            }
-            print(f'{datetime.now()}: Updated contract for {market}: {contract}')
-            return True
-        except Exception as e:
-            print(f'{datetime.now()}: Failed to qualify contract for {market}: {str(e)}')
-            return False
-    
-    def check_for_rolls(self):
-        """Check if any contracts need to be rolled"""
-        today = datetime.now().date()
-        
-        for market in self.markets:
-            if market not in self.current_contracts:
-                self.update_contract(market)
-                continue
-                
-            # Find the current active instrument
-            market_instruments = self.instruments_df[self.instruments_df['market'] == market]
-            current_instrument = market_instruments[
-                (market_instruments['start_date'].dt.date <= today) & 
-                (market_instruments['end_date'].dt.date > today)
-            ]
-            
-            if len(current_instrument) == 0:
-                continue
-                
-            current_symbol = current_instrument.iloc[0]['symbol']
-            stored_symbol = self.current_contracts[market]['symbol']
-            
-            # If the symbol has changed, we need to roll
-            if current_symbol != stored_symbol:
-                print(f'{datetime.now()}: Contract roll detected for {market}: {stored_symbol} -> {current_symbol}')
-                self.update_contract(market)
