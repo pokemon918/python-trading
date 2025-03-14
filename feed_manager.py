@@ -12,7 +12,9 @@ import pytz
 import sys
 import ib_async
 import asyncio
-import psycopg2
+import logging
+from functools import wraps
+import traceback
 
 from constants import BarMinutes, BarTypes, OHLC, Severity
 from database_health import write_activity
@@ -64,6 +66,168 @@ eastern_tz = pytz.timezone('US/Eastern')
 status_enabled = 'enabled'
 status_processed_database_bars = 'processed_database_bars'
           
+CONNECTION_RETRY_DELAY = 10  # seconds
+MAX_RECONNECTION_ATTEMPTS = 5
+CONNECTION_TIMEOUT = 30  # seconds
+
+class IBConnectionManager:
+    def __init__(self, host='127.0.0.1', port=4002, client_id=1):
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        self.ib = None
+        self.connected = False
+        self.reconnection_attempts = 0
+        self.last_connection_time = None
+        self.markets_status = {}  # Track connection status for each market
+        self.connection_status_channel = "connection_status"  # Redis channel for connection status
+
+    def connect(self, redis_cache=None):
+        """Establish connection to Interactive Brokers with retry logic"""
+        if self.connected and self.ib is not None:
+            return self.ib
+            
+        try:
+            print(f'{datetime.now()}: Connecting to IB at {self.host}:{self.port}')
+            print(f'{datetime.now()}: Please ensure TWS or IB Gateway is running and configured for API connections')
+            
+            ib_async.util.startLoop()
+            self.ib = ib_async.IB()
+            
+            # Set up connection timeout
+            connection_timeout = time.time() + CONNECTION_TIMEOUT
+            
+            # Connect with timeout handling
+            connection_task = self.ib.connect(self.host, self.port, clientId=self.client_id)
+            
+            # Wait for connection with timeout
+            while not self.ib.isConnected() and time.time() < connection_timeout:
+                time.sleep(0.1)
+                
+            if not self.ib.isConnected():
+                raise TimeoutError(f"Connection to IB timed out after {CONNECTION_TIMEOUT} seconds. Please verify that TWS/IB Gateway is running and API connections are enabled.")
+                
+            self.connected = True
+            self.reconnection_attempts = 0
+            self.last_connection_time = datetime.now()
+            
+            # Set up disconnect callback
+            self.ib.disconnectedEvent += self._handle_disconnect
+            
+            # Publish connection status to Redis if available
+            if redis_cache:
+                try:
+                    self._publish_connection_status(redis_cache, True)
+                except Exception as e:
+                    print(f'{datetime.now()}: Warning - Failed to publish to Redis: {str(e)}')
+                
+            print(f'{datetime.now()}: Successfully connected to IB')
+            return self.ib
+            
+        except Exception as e:
+            self.connected = False
+            self.reconnection_attempts += 1
+            error_msg = f"Failed to connect to IB: {str(e)}"
+            print(f'{datetime.now()}: {error_msg}')
+            
+            # Log the error
+            write_activity('FeedManager', datetime.now(), Severity.Critical, 
+                          error_msg, False, save_activity, settings.host, 
+                          settings.strategies_database, settings.user, settings.password)
+            
+            # Publish connection status to Redis if available
+            if redis_cache:
+                try:
+                    self._publish_connection_status(redis_cache, False)
+                except Exception as redis_error:
+                    print(f'{datetime.now()}: Warning - Failed to publish to Redis: {str(redis_error)}')
+                
+            # Retry connection if under max attempts
+            if self.reconnection_attempts < MAX_RECONNECTION_ATTEMPTS:
+                print(f'{datetime.now()}: Retrying connection in {CONNECTION_RETRY_DELAY} seconds (attempt {self.reconnection_attempts}/{MAX_RECONNECTION_ATTEMPTS})')
+                time.sleep(CONNECTION_RETRY_DELAY)
+                return self.connect(redis_cache)
+            else:
+                raise ConnectionError(f"Failed to connect to IB after {MAX_RECONNECTION_ATTEMPTS} attempts")
+
+    def _handle_disconnect(self):
+        """Handle disconnection events from IB"""
+        self.connected = False
+        disconnect_time = datetime.now()
+        time_since_last = (disconnect_time - self.last_connection_time).total_seconds() if self.last_connection_time else 0
+        
+        error_msg = f"Disconnected from IB at {disconnect_time}. Connection was active for {time_since_last} seconds"
+        print(f'{datetime.now()}: {error_msg}')
+        
+        # Log the disconnection
+        write_activity('FeedManager', disconnect_time, Severity.Warning, 
+                      error_msg, False, save_activity, settings.host, 
+                      settings.strategies_database, settings.user, settings.password)
+        
+        # Attempt to reconnect
+        self.reconnect()
+
+    def reconnect(self, redis_cache=None):
+        """Attempt to reconnect to IB"""
+        if self.connected:
+            return self.ib
+            
+        # Reset connection state
+        if self.ib:
+            try:
+                self.ib.disconnect()
+            except:
+                pass
+            
+        self.ib = None
+        self.connected = False
+        
+        # Attempt to reconnect
+        return self.connect(redis_cache)
+
+    def disconnect(self):
+        """Safely disconnect from IB"""
+        if self.ib and self.connected:
+            try:
+                self.ib.disconnect()
+                print(f'{datetime.now()}: Successfully disconnected from IB')
+            except Exception as e:
+                print(f'{datetime.now()}: Error during disconnection: {str(e)}')
+            finally:
+                self.connected = False
+                self.ib = None
+
+    def update_market_status(self, market, is_connected, redis_cache=None):
+        """Update connection status for a specific market"""
+        self.markets_status[market] = is_connected
+        
+        # Publish market-specific status to Redis if available
+        if redis_cache:
+            redis_cache.hset("market_connection_status", market, "1" if is_connected else "0")
+            redis_cache.publish(f"market:{market}:connection_status", "connected" if is_connected else "disconnected")
+            
+        # Log status change
+        status_msg = f"Market {market} connection status changed to {'connected' if is_connected else 'disconnected'}"
+        print(f'{datetime.now()}: {status_msg}')
+        
+        severity = Severity.Info if is_connected else Severity.Warning
+        write_activity('FeedManager', datetime.now(), severity, 
+                      status_msg, False, save_activity, settings.host, 
+                      settings.strategies_database, settings.user, settings.password)
+
+    def _publish_connection_status(self, redis_cache, is_connected):
+        """Publish overall connection status to Redis"""
+        if redis_cache:
+            try:
+                status_message = json.dumps({
+                    "connected": is_connected,
+                    "timestamp": datetime.now().isoformat(),
+                    "reconnection_attempts": self.reconnection_attempts
+                })
+                redis_cache.publish(self.connection_status_channel, status_message)
+            except Exception as e:
+                print(f'{datetime.now()}: Warning - Failed to publish to Redis: {str(e)}')
+
 def subscribe_to_live_data(ib, unique_markets, contracts):
     for market in unique_markets:
 
@@ -123,47 +287,24 @@ def prepare_data(unique_markets):
     return all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status
 
 def on_pending_tickers(tickers):
-    """Handle incoming ticks with improved bar creation logic"""
-    for ticker in tickers:
-        if ticker.contract.localSymbol in market_lookup:
-            market = market_lookup[ticker.contract.localSymbol]
-            
-            # Get current timestamp with proper timezone handling
-            current_time = datetime.now(eastern_tz)
-            
-            # Process the tick
-            process_tick(market, ticker, current_time)
 
-def process_tick(market, ticker, current_time):
-    """Process a single tick with improved bar handling"""
-    # Extract tick data
-    last_price = ticker.last
-    volume = ticker.volume
-    
-    # Store last price and volume
-    all_last_prices[market] = last_price
-    all_volumes[market] = volume
-    
-    # Check if we need to create a new bar based on broker timestamp
-    broker_time = ticker.time if hasattr(ticker, 'time') else current_time
-    
-    # Remove timezone for consistent comparison if needed
-    if broker_time.tzinfo:
-        broker_time = broker_time.replace(tzinfo=None)
-    
-    # Get current bar minute
-    current_bar_minute = get_bar_minute(broker_time)
-    last_bar_minute = get_last_bar_minute(market)
-    
-    # If we've moved to a new minute, close the current bar and create a new one
-    if current_bar_minute != last_bar_minute and last_bar_minute is not None:
-        # Use a lock to prevent double closure
-        if not is_bar_being_closed(market, last_bar_minute):
-            try:
-                set_bar_closing_status(market, last_bar_minute, True)
-                close_and_create_bar(market, last_bar_minute, broker_time, last_price, volume)
-            finally:
-                set_bar_closing_status(market, last_bar_minute, False)
+    current_timestamp = datetime.now()
+    end_current_minute_timestamp = current_timestamp.replace(second=0, microsecond=0)
+    end_current_minute_timestamp = end_current_minute_timestamp + timedelta(minutes=1)
+
+    for ticker in tickers:
+        if not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+            symbol = ticker.contract.localSymbol
+            market = market_lookup[symbol]
+            if market in all_ticks:
+                mid = (ticker.bid + ticker.ask) / 2
+
+                if end_current_minute_timestamp not in all_ticks[market]:
+                    all_ticks[market][end_current_minute_timestamp] = []
+
+                all_ticks[market][end_current_minute_timestamp].append(mid)
+                all_volumes[market][end_current_minute_timestamp] = ticker.rtTradeVolume
+                # print(f'{datetime.now()},Tick,{market},{mid},{ticker.rtTradeVolume},{end_current_minute_timestamp}')
 
 def schedule_next_minute():
     current_time = time.time()  # Current time in seconds since the epoch
@@ -371,8 +512,6 @@ def get_database_bars(markets, start_week):
                 last_5_values = all_database_bars[market][BarTypes.Minute1.value][key][-5:]
                 print(f"{market} = {key}: {last_5_values}")
 
-    return True
-
 def get_broker_bars_from_exchange(contracts, market):
 
     contract = contracts[market]
@@ -434,10 +573,17 @@ def store_bar(redis_cache, market, bar_type, datetime, open, high, low, close, v
     redis_cache.publish(f"{market}:{bar_type}:update", "new_bar")
 
 def create_redis_cache():
-
-    # Connect to the Redis server
-    redis_cache = redis.Redis(host='localhost', port=6379, db=0)
-    return redis_cache
+    try:
+        # Connect to the Redis server
+        redis_cache = redis.Redis(host='localhost', port=6379, db=0)
+        # Test the connection
+        redis_cache.ping()
+        print(f'{datetime.now()}: Successfully connected to Redis')
+        return redis_cache
+    except redis.ConnectionError as e:
+        print(f'{datetime.now()}: Warning - Redis connection failed: {str(e)}')
+        print(f'{datetime.now()}: Feed Manager will continue without Redis functionality')
+        return None
 
 def check_markets(markets, instruments_df):
     markets_set = set(markets)
@@ -460,41 +606,7 @@ async def main():
     # Run script
     asyncio.wait(3000)    
 
-def initialize_feed_manager():
-    # 1. Connect to IB
-    ib = connect_to_interactive_brokers()
-    
-    # 2. Load instrument data first
-    instruments_df = get_current_instruments(datetime.now(), markets, settings.host, 
-                                           settings.strategies_database, settings.user, settings.password)
-    
-    # 3. Initialize data structures
-    all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status = prepare_data(markets)
-    
-    # 4. Create Redis cache
-    redis_cache = create_redis_cache()
-    
-    # 5. Setup contracts
-    contracts, market_lookup, symbol_lookup = get_ib_contracts(markets, instruments_df)
-    
-    # 6. Load database bars with validation
-    database_bars_loaded = get_database_bars(markets, start_week)
-    
-    # 7. Only proceed with joining if database bars are loaded
-    if database_bars_loaded:
-        # Now safe to join bars and run data integrity
-        process_and_join_bars(markets, all_database_bars, all_broker_bars)
-    
-    # 8. Setup market data subscription only after initialization is complete
-    subscribe_to_live_data(ib, markets, contracts)
-    
-    # 9. Setup connection monitoring
-    start_connection_monitor(ib, markets)
-    
-    return ib, contracts, market_lookup, symbol_lookup, redis_cache, all_bars
-
 if __name__ == "__main__":
-
     print(f'{datetime.now()}: Starting Feed Manager')
 
     broker = 'IB'
@@ -507,208 +619,61 @@ if __name__ == "__main__":
     start_week = get_current_start_week_datetime()
     holidays_df = get_holidays(settings.host, settings.strategies_database, settings.user, settings.password)
 
-    print(f'{datetime.now()}: Connecting')
+    # Create Redis cache with error handling
+    redis_cache = create_redis_cache()
 
-    ib_async.util.startLoop()
-    ib = ib_async.IB()
-    ib.connect('127.0.0.1', 4002, clientId=1)
-
-    redis_cache = create_redis_cache()    
-
-    contracts, market_lookup, symbol_lookup = get_ib_contracts(markets, instruments_df)
-    all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status = prepare_data(markets)
-
-    ib.pendingTickersEvent += on_pending_tickers
-
-    print(f'{datetime.now()}: Subscribing to Live Data')
-    subscribe_to_live_data(ib, markets, contracts)
-
-    print(f'{datetime.now()}: Syncing Live Pricing')
-
-    schedule_next_minute()
-
-    ib.sleep(120)
-
-    get_database_bars(markets, start_week)
-
-    # Causes RuntimeWarning: coroutine 'wait' was never awaited
-    # asyncio.run(main())    
-
-    run_seconds = 600
-    print(f'{datetime.now()}: Running for {run_seconds} seconds')    
-    ib.sleep(run_seconds)
-    print(f'{datetime.now()}: Run time has finished')    
-
-    print(f'{datetime.now()}: Disconnecting')    
-
-    # TODO: Need to stop timer
-
-    for contract in contracts.values():        
-        ib.cancelMktData(contract)    
-
-    print(f'{datetime.now()}: Finish')
-
-    ib.disconnect()
-
-    print(f'{datetime.now()}: Disconnected')
-
-# New connection monitoring system
-def start_connection_monitor(ib, markets):
-    """Start a background task to monitor IB connection status"""
-    asyncio.create_task(connection_monitor_task(ib, markets))
-
-async def connection_monitor_task(ib, markets):
-    """Monitor connection status and handle reconnection"""
-    while True:
-        if not ib.isConnected():
-            print(f'{datetime.now()}: Connection lost, attempting to reconnect')
-            # Update market status
-            update_market_status(markets, 'disconnected')
-            # Attempt reconnection
-            try:
-                ib.connect('127.0.0.1', 4002, clientId=1)
-                if ib.isConnected():
-                    print(f'{datetime.now()}: Reconnection successful')
-                    # Update market status
-                    update_market_status(markets, 'connected')
-            except Exception as e:
-                print(f'{datetime.now()}: Reconnection failed: {str(e)}')
-        
-        # Check every 5 seconds
-        await asyncio.sleep(5)
-
-def update_market_status(markets, status):
-    """Update market status in Redis for live trading system"""
+    # Create and connect the IB connection manager
+    connection_manager = IBConnectionManager(host='127.0.0.1', port=4002, client_id=1)
     try:
-        r = redis.Redis(host='localhost', port=6379, db=0)
-        for market in markets:
-            r.publish('market_status', json.dumps({
-                'market': market,
-                'status': status,
-                'timestamp': datetime.now().isoformat()
-            }))
-    except Exception as e:
-        print(f'{datetime.now()}: Failed to update market status: {str(e)}')
-
-# Symbol resolution service
-def resolve_symbol(market, date=None):
-    """Resolve the correct symbol for a market on a given date"""
-    if date is None:
-        date = datetime.now()
-    
-    # Query the database for the correct instrument
-    query = """
-    SELECT symbol, expiry 
-    FROM instruments 
-    WHERE market = %s 
-    AND start_date <= %s 
-    AND end_date > %s
-    """
-    
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            host=settings.host,
-            database=settings.strategies_database,
-            user=settings.user,
-            password=settings.password
-        )
-        cursor = conn.cursor()
-        cursor.execute(query, (market, date, date))
-        result = cursor.fetchone()
+        ib = connection_manager.connect(redis_cache)
         
-        if result:
-            return result[0]  # Return the symbol
-        else:
-            print(f'{datetime.now()}: No symbol found for {market} on {date}')
-            return None
+        contracts, market_lookup, symbol_lookup = get_ib_contracts(markets, instruments_df)
+        all_ticks, all_bars, all_database_bars, all_broker_bars, all_last_prices, all_volumes, all_status = prepare_data(markets)
+
+        ib.pendingTickersEvent += on_pending_tickers
+
+        print(f'{datetime.now()}: Subscribing to Live Data')
+        subscribe_to_live_data(ib, markets, contracts)
+
+        print(f'{datetime.now()}: Syncing Live Pricing')
+
+        schedule_next_minute()
+
+        ib.sleep(120)
+
+        get_database_bars(markets, start_week)
+
+        run_seconds = 600
+        print(f'{datetime.now()}: Running for {run_seconds} seconds')    
+        ib.sleep(run_seconds)
+        print(f'{datetime.now()}: Run time has finished')    
+
+    except ConnectionError as e:
+        error_msg = f"Connection error: {str(e)}"
+        print(f'{datetime.now()}: {error_msg}')
+        print(f'{datetime.now()}: Please ensure TWS/IB Gateway is running and properly configured')
+        write_activity('FeedManager', datetime.now(), Severity.Critical, 
+                      error_msg, False, save_activity, settings.host, 
+                      settings.strategies_database, settings.user, settings.password)
     except Exception as e:
-        print(f'{datetime.now()}: Error resolving symbol: {str(e)}')
-        return None
+        error_msg = f"Error in Feed Manager: {str(e)}\n{traceback.format_exc()}"
+        print(f'{datetime.now()}: {error_msg}')
+        write_activity('FeedManager', datetime.now(), Severity.Critical, 
+                      error_msg, False, save_activity, settings.host, 
+                      settings.strategies_database, settings.user, settings.password)
     finally:
-        if conn:
-            conn.close()
+        print(f'{datetime.now()}: Disconnecting')    
 
-# Contract roll handler
-class ContractRollManager:
-    def __init__(self, ib, markets, instruments_df):
-        self.ib = ib
-        self.markets = markets
-        self.instruments_df = instruments_df
-        self.current_contracts = {}
-        self.initialize_contracts()
-    
-    def initialize_contracts(self):
-        """Initialize contracts for all markets"""
-        for market in self.markets:
-            self.update_contract(market)
-    
-    def update_contract(self, market):
-        """Update contract for a specific market"""
-        today = datetime.now().date()
-        
-        # Find the current active instrument
-        market_instruments = self.instruments_df[self.instruments_df['market'] == market]
-        current_instrument = market_instruments[
-            (market_instruments['start_date'].dt.date <= today) & 
-            (market_instruments['end_date'].dt.date > today)
-        ]
-        
-        if len(current_instrument) == 0:
-            print(f'{datetime.now()}: No active instrument found for {market}')
-            return False
-        
-        # Extract contract details
-        row = current_instrument.iloc[0]
-        expiry_date = row['expiry'].strftime('%Y%m')
-        exchange = row['exchange']
-        symbol = row['symbol']
-        
-        # Create and qualify the contract
-        contract = ib_async.Future(
-            symbol=market, 
-            exchange=exchange, 
-            lastTradeDateOrContractMonth=expiry_date, 
-            currency='USD'
-        )
-        
-        try:
-            self.ib.qualifyContracts(contract)
-            self.current_contracts[market] = {
-                'contract': contract,
-                'symbol': symbol,
-                'expiry': row['expiry'],
-                'last_checked': datetime.now()
-            }
-            print(f'{datetime.now()}: Updated contract for {market}: {contract}')
-            return True
-        except Exception as e:
-            print(f'{datetime.now()}: Failed to qualify contract for {market}: {str(e)}')
-            return False
-    
-    def check_for_rolls(self):
-        """Check if any contracts need to be rolled"""
-        today = datetime.now().date()
-        
-        for market in self.markets:
-            if market not in self.current_contracts:
-                self.update_contract(market)
-                continue
-                
-            # Find the current active instrument
-            market_instruments = self.instruments_df[self.instruments_df['market'] == market]
-            current_instrument = market_instruments[
-                (market_instruments['start_date'].dt.date <= today) & 
-                (market_instruments['end_date'].dt.date > today)
-            ]
-            
-            if len(current_instrument) == 0:
-                continue
-                
-            current_symbol = current_instrument.iloc[0]['symbol']
-            stored_symbol = self.current_contracts[market]['symbol']
-            
-            # If the symbol has changed, we need to roll
-            if current_symbol != stored_symbol:
-                print(f'{datetime.now()}: Contract roll detected for {market}: {stored_symbol} -> {current_symbol}')
-                self.update_contract(market)
+        # Cancel market data subscriptions
+        if 'contracts' in locals() and 'ib' in locals() and connection_manager.connected:
+            for contract in contracts.values():        
+                try:
+                    ib.cancelMktData(contract)
+                except:
+                    pass
+
+        # Disconnect from IB
+        if 'connection_manager' in locals():
+            connection_manager.disconnect()
+
+        print(f'{datetime.now()}: Finish')
